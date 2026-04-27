@@ -3,9 +3,10 @@ import math
 import logging
 from pybit.unified_trading import HTTP
 from config import (
-    API_KEY, API_SECRET, DEMO_MODE, SYMBOL, CATEGORY,
+    API_KEY, API_SECRET, DEMO_MODE, CATEGORY,
     LEVERAGE, RISK_PER_TRADE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
-    MAX_OPEN_POSITIONS, TIMEFRAME, SCAN_INTERVAL, CAPITAL_LIMIT
+    MAX_OPEN_POSITIONS, TIMEFRAME, SCAN_INTERVAL, CAPITAL_LIMIT,
+    TOP_SYMBOLS_COUNT
 )
 from strategy import calculate_signals
 from telegram_notify import notify_start, notify_trade, notify_error
@@ -30,6 +31,17 @@ def get_client() -> HTTP:
     )
 
 
+def get_top_symbols(client: HTTP) -> list[str]:
+    """Топ пар по 24ч объёму торгов."""
+    r = client.get_tickers(category=CATEGORY)
+    tickers = r["result"]["list"]
+    usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
+    usdt.sort(key=lambda t: float(t.get("turnover24h", 0)), reverse=True)
+    symbols = [t["symbol"] for t in usdt[:TOP_SYMBOLS_COUNT]]
+    log.info(f"Сканируем {len(symbols)} пар: {symbols[:10]}...")
+    return symbols
+
+
 def get_balance(client: HTTP) -> float:
     r = client.get_wallet_balance(accountType="UNIFIED", coin="USDT")
     coins = r["result"]["list"][0]["coin"]
@@ -40,21 +52,25 @@ def get_balance(client: HTTP) -> float:
     return 0.0
 
 
-def get_candles(client: HTTP) -> list:
-    r = client.get_kline(category=CATEGORY, symbol=SYMBOL, interval=TIMEFRAME, limit=100)
+def get_candles(client: HTTP, symbol: str) -> list:
+    r = client.get_kline(category=CATEGORY, symbol=symbol, interval=TIMEFRAME, limit=100)
     return r["result"]["list"]
 
 
-def get_open_positions(client: HTTP) -> list:
-    r = client.get_positions(category=CATEGORY, symbol=SYMBOL)
-    return [p for p in r["result"]["list"] if float(p["size"]) > 0]
+def get_open_positions(client: HTTP) -> dict[str, dict]:
+    r = client.get_positions(category=CATEGORY, settleCoin="USDT")
+    return {
+        p["symbol"]: p
+        for p in r["result"]["list"]
+        if float(p["size"]) > 0
+    }
 
 
-def set_leverage(client: HTTP):
+def set_leverage(client: HTTP, symbol: str):
     try:
         client.set_leverage(
             category=CATEGORY,
-            symbol=SYMBOL,
+            symbol=symbol,
             buyLeverage=str(LEVERAGE),
             sellLeverage=str(LEVERAGE),
         )
@@ -69,40 +85,41 @@ def calc_qty(price: float, balance: float) -> float:
     return math.floor(qty * 1000) / 1000
 
 
-def place_order(client: HTTP, side: str, price: float, balance: float):
+def place_order(client: HTTP, symbol: str, side: str, price: float, balance: float):
     qty = calc_qty(price, balance)
     if qty <= 0:
-        log.warning("Недостаточно баланса для открытия позиции")
         return
 
     if side == "BUY":
-        sl = round(price * (1 - STOP_LOSS_PCT), 2)
-        tp = round(price * (1 + TAKE_PROFIT_PCT), 2)
+        sl = round(price * (1 - STOP_LOSS_PCT), 4)
+        tp = round(price * (1 + TAKE_PROFIT_PCT), 4)
         bybit_side = "Buy"
     else:
-        sl = round(price * (1 + STOP_LOSS_PCT), 2)
-        tp = round(price * (1 - TAKE_PROFIT_PCT), 2)
+        sl = round(price * (1 + STOP_LOSS_PCT), 4)
+        tp = round(price * (1 - TAKE_PROFIT_PCT), 4)
         bybit_side = "Sell"
 
-    r = client.place_order(
-        category=CATEGORY,
-        symbol=SYMBOL,
-        side=bybit_side,
-        orderType="Market",
-        qty=str(qty),
-        stopLoss=str(sl),
-        takeProfit=str(tp),
-        timeInForce="GTC",
-    )
-    order_id = r["result"].get("orderId")
-    log.info(f"ОРДЕР {side} | qty={qty} | цена={price} | SL={sl} | TP={tp} | id={order_id}")
-    notify_trade(side, SYMBOL, qty, price, sl, tp, DEMO_MODE)
+    try:
+        r = client.place_order(
+            category=CATEGORY,
+            symbol=symbol,
+            side=bybit_side,
+            orderType="Market",
+            qty=str(qty),
+            stopLoss=str(sl),
+            takeProfit=str(tp),
+            timeInForce="GTC",
+        )
+        order_id = r["result"].get("orderId")
+        log.info(f"ОРДЕР {side} {symbol} | qty={qty} | цена={price} | SL={sl} | TP={tp} | id={order_id}")
+        notify_trade(side, symbol, qty, price, sl, tp, DEMO_MODE)
+    except Exception as e:
+        log.error(f"Ошибка ордера {symbol}: {e}")
 
 
 def run():
-    log.info(f"=== БОТ ЗАПУЩЕН | ДЕМО={DEMO_MODE} | {SYMBOL} x{LEVERAGE} ===")
+    log.info(f"=== БОТ ЗАПУЩЕН | ДЕМО={DEMO_MODE} | ТОП-{TOP_SYMBOLS_COUNT} пар | x{LEVERAGE} ===")
     client = get_client()
-    set_leverage(client)
 
     balance = get_balance(client)
     notify_start(DEMO_MODE, balance, CAPITAL_LIMIT)
@@ -112,22 +129,40 @@ def run():
     while True:
         try:
             balance = get_balance(client)
-            positions = get_open_positions(client)
-            open_count = len(positions)
+            open_positions = get_open_positions(client)
+            open_count = len(open_positions)
 
-            candles = get_candles(client)
-            sig = calculate_signals(candles)
+            log.info(f"Баланс={balance:.2f} USDT | Открытых позиций={open_count}/{MAX_OPEN_POSITIONS}")
 
-            log.info(
-                f"Баланс={balance:.2f} | Позиций={open_count} | "
-                f"RSI={sig['rsi']} | EMA9={sig['ema_fast']} | EMA21={sig['ema_slow']} | "
-                f"Цена={sig['price']} | Сигнал={sig['signal']}"
-            )
+            if open_count >= MAX_OPEN_POSITIONS:
+                log.info("Лимит позиций достигнут, ждём")
+                time.sleep(SCAN_INTERVAL)
+                continue
 
-            if sig["signal"] and open_count < MAX_OPEN_POSITIONS:
-                place_order(client, sig["signal"], sig["price"], balance)
-            elif open_count >= MAX_OPEN_POSITIONS:
-                log.info("Лимит позиций достигнут, пропускаем")
+            symbols = get_top_symbols(client)
+            signals_found = 0
+
+            for symbol in symbols:
+                if open_count + signals_found >= MAX_OPEN_POSITIONS:
+                    break
+                if symbol in open_positions:
+                    continue
+
+                try:
+                    candles = get_candles(client, symbol)
+                    sig = calculate_signals(candles)
+
+                    if sig["signal"]:
+                        log.info(f"СИГНАЛ {sig['signal']} на {symbol} | RSI={sig['rsi']} | цена={sig['price']}")
+                        set_leverage(client, symbol)
+                        place_order(client, symbol, sig["signal"], sig["price"], balance)
+                        signals_found += 1
+
+                except Exception as e:
+                    log.warning(f"Ошибка {symbol}: {e}")
+                    continue
+
+                time.sleep(0.2)
 
             consecutive_errors = 0
 
