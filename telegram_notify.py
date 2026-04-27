@@ -62,5 +62,15 @@ def notify_start(demo: bool, balance: float, capital_limit: float):
     )
 
 
+def notify_close(symbol: str, side: str, pnl: float, demo: bool):
+    mode = "🟡 ДЕМО" if demo else "🟢 РЕАЛ"
+    emoji = "✅" if pnl >= 0 else "❌"
+    _send(
+        f"{emoji} <b>СДЕЛКА ЗАКРЫТА</b> [{mode}]\n"
+        f"Пара: <b>{symbol}</b> ({side})\n"
+        f"PnL: <b>{'+'if pnl>=0 else ''}{pnl:.4f} USDT</b>"
+    )
+
+
 def notify_error(msg: str):
     _send(f"⚠️ <b>Ошибка бота:</b>\n{msg}")

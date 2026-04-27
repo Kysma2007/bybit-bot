@@ -10,7 +10,7 @@ from config import (
     TOP_SYMBOLS_COUNT
 )
 from strategy import calculate_signals
-from telegram_notify import notify_start, notify_trade, notify_error
+from telegram_notify import notify_start, notify_trade, notify_close, notify_error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -172,12 +172,22 @@ def run():
     notify_start(DEMO_MODE, balance, CAPITAL_LIMIT)
 
     consecutive_errors = 0
+    prev_positions: dict[str, dict] = {}
 
     while True:
         try:
             balance = get_balance(client)
             open_positions = get_open_positions(client)
             open_count = len(open_positions)
+
+            # Уведомляем о закрытых позициях
+            for sym, pos in prev_positions.items():
+                if sym not in open_positions:
+                    pnl = float(pos.get("unrealisedPnl", 0))
+                    side = pos.get("side", "")
+                    notify_close(sym, side, pnl, DEMO_MODE)
+                    log.info(f"ЗАКРЫТА {sym} {side} | PnL={pnl:.4f}")
+            prev_positions = dict(open_positions)
 
             log.info(f"Баланс={balance:.2f} USDT | Открытых позиций={open_count}/{MAX_OPEN_POSITIONS}")
 
