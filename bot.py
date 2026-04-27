@@ -200,10 +200,16 @@ def run():
                     sig = calculate_signals(candles)
 
                     if sig["signal"]:
-                        log.info(f"СИГНАЛ {sig['signal']} на {symbol} | RSI={sig['rsi']} | цена={sig['price']}")
+                        log.info(
+                            f"СИГНАЛ {sig['signal']} {symbol} | "
+                            f"RSI={sig['rsi']} | BUY={sig['buy_score']} SELL={sig['sell_score']} | "
+                            f"цена={sig['price']}"
+                        )
                         set_leverage(client, symbol)
                         place_order(client, symbol, sig["signal"], sig["price"], balance)
                         signals_found += 1
+                    else:
+                        log.debug(f"{symbol} | BUY={sig['buy_score']} SELL={sig['sell_score']} | нет сигнала")
 
                 except Exception as e:
                     log.warning(f"Ошибка {symbol}: {e}")
