@@ -1,6 +1,7 @@
 import time
 import math
 import logging
+from decimal import Decimal, ROUND_DOWN
 from pybit.unified_trading import HTTP
 from config import (
     API_KEY, API_SECRET, DEMO_MODE, CATEGORY,
@@ -21,6 +22,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Кэш спецификаций инструментов: symbol -> {qtyStep, minOrderQty, tickSize}
+_instrument_cache: dict[str, dict] = {}
+
 
 def get_client() -> HTTP:
     return HTTP(
@@ -31,8 +35,30 @@ def get_client() -> HTTP:
     )
 
 
+def load_instruments(client: HTTP):
+    """Загружает спецификации всех инструментов в кэш."""
+    r = client.get_instruments_info(category=CATEGORY)
+    for item in r["result"]["list"]:
+        sym = item["symbol"]
+        lot = item["lotSizeFilter"]
+        price_filter = item["priceFilter"]
+        _instrument_cache[sym] = {
+            "qtyStep": lot.get("qtyStep", "1"),
+            "minOrderQty": lot.get("minOrderQty", "1"),
+            "tickSize": price_filter.get("tickSize", "0.01"),
+        }
+    log.info(f"Загружено {len(_instrument_cache)} инструментов")
+
+
+def round_step(value: float, step: str) -> str:
+    """Округляет value вниз до шага step, возвращает строку."""
+    d_value = Decimal(str(value))
+    d_step = Decimal(step)
+    rounded = (d_value // d_step) * d_step
+    return str(rounded.quantize(d_step, rounding=ROUND_DOWN))
+
+
 def get_top_symbols(client: HTTP) -> list[str]:
-    """Топ пар по 24ч объёму торгов."""
     r = client.get_tickers(category=CATEGORY)
     tickers = r["result"]["list"]
     usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
@@ -78,25 +104,45 @@ def set_leverage(client: HTTP, symbol: str):
         pass
 
 
-def calc_qty(price: float, balance: float) -> float:
+def calc_qty(symbol: str, price: float, balance: float) -> str | None:
+    """Считает размер позиции с учётом qtyStep и minOrderQty конкретной пары."""
+    spec = _instrument_cache.get(symbol)
+    if not spec:
+        return None
+
     effective_balance = min(balance, CAPITAL_LIMIT)
     trade_capital = effective_balance * RISK_PER_TRADE * LEVERAGE
-    qty = trade_capital / price
-    return math.floor(qty * 1000) / 1000
+    raw_qty = trade_capital / price
+
+    qty_str = round_step(raw_qty, spec["qtyStep"])
+
+    # Проверяем минимальный размер
+    if Decimal(qty_str) < Decimal(spec["minOrderQty"]):
+        log.warning(f"{symbol}: qty {qty_str} < minOrderQty {spec['minOrderQty']}, пропускаем")
+        return None
+
+    return qty_str
+
+
+def round_price(price: float, tick_size: str) -> str:
+    return round_step(price, tick_size)
 
 
 def place_order(client: HTTP, symbol: str, side: str, price: float, balance: float):
-    qty = calc_qty(price, balance)
-    if qty <= 0:
+    spec = _instrument_cache.get(symbol, {})
+    tick = spec.get("tickSize", "0.01")
+
+    qty_str = calc_qty(symbol, price, balance)
+    if not qty_str:
         return
 
     if side == "BUY":
-        sl = round(price * (1 - STOP_LOSS_PCT), 4)
-        tp = round(price * (1 + TAKE_PROFIT_PCT), 4)
+        sl = round_price(price * (1 - STOP_LOSS_PCT), tick)
+        tp = round_price(price * (1 + TAKE_PROFIT_PCT), tick)
         bybit_side = "Buy"
     else:
-        sl = round(price * (1 + STOP_LOSS_PCT), 4)
-        tp = round(price * (1 - TAKE_PROFIT_PCT), 4)
+        sl = round_price(price * (1 + STOP_LOSS_PCT), tick)
+        tp = round_price(price * (1 - TAKE_PROFIT_PCT), tick)
         bybit_side = "Sell"
 
     try:
@@ -105,14 +151,14 @@ def place_order(client: HTTP, symbol: str, side: str, price: float, balance: flo
             symbol=symbol,
             side=bybit_side,
             orderType="Market",
-            qty=str(qty),
-            stopLoss=str(sl),
-            takeProfit=str(tp),
+            qty=qty_str,
+            stopLoss=sl,
+            takeProfit=tp,
             timeInForce="GTC",
         )
         order_id = r["result"].get("orderId")
-        log.info(f"ОРДЕР {side} {symbol} | qty={qty} | цена={price} | SL={sl} | TP={tp} | id={order_id}")
-        notify_trade(side, symbol, qty, price, sl, tp, DEMO_MODE)
+        log.info(f"ОРДЕР {side} {symbol} | qty={qty_str} | цена={price} | SL={sl} | TP={tp} | id={order_id}")
+        notify_trade(side, symbol, float(qty_str), price, float(sl), float(tp), DEMO_MODE)
     except Exception as e:
         log.error(f"Ошибка ордера {symbol}: {e}")
 
@@ -120,6 +166,7 @@ def place_order(client: HTTP, symbol: str, side: str, price: float, balance: flo
 def run():
     log.info(f"=== БОТ ЗАПУЩЕН | ДЕМО={DEMO_MODE} | ТОП-{TOP_SYMBOLS_COUNT} пар | x{LEVERAGE} ===")
     client = get_client()
+    load_instruments(client)
 
     balance = get_balance(client)
     notify_start(DEMO_MODE, balance, CAPITAL_LIMIT)
